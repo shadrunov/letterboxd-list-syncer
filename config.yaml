@@ -3,3 +3,5 @@ username: shadrunov
 lists:
   - source: https://letterboxd.com/cokewithglitter/list/aa-vampire-season/
     target: "a&a: vampire season"
+  - source: https://letterboxd.com/cokewithglitter/list/aa-italian-neorealism/
+    target: "a&a: italian neorealism"
