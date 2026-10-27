@@ -194,15 +194,13 @@ impl LetterboxdClient {
             } else {
                 base.join(&format!("page/{page}/"))?
             };
-            let response = self.http.get(page_url.clone()).send().await?;
-            if response.status() == StatusCode::NOT_FOUND {
+            let (status, html) = self.authenticated_request("GET", page_url.as_str(), None)?;
+            if status == StatusCode::NOT_FOUND {
                 return Ok(None);
             }
-            let html = response
-                .error_for_status()
-                .with_context(|| format!("failed to fetch {page_url}"))?
-                .text()
-                .await?;
+            if !status.is_success() {
+                bail!("failed to fetch {page_url}: HTTP {status}");
+            }
             let document = Html::parse_document(&html);
             for link in document.select(&selector) {
                 let title = link.text().collect::<String>();
