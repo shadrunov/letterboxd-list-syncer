@@ -27,15 +27,20 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = Config::load(&args.config)?;
     let client = LetterboxdClient::from_env()?;
+    let list_urls = if args.dry_run {
+        Default::default()
+    } else {
+        client.list_urls(&config.username).await?
+    };
 
     for pair in &config.lists {
         let source = client.fetch_public_list(&pair.source).await?;
         let target_url = if args.dry_run {
             pair.target_url(&config.username)
         } else {
-            client
-                .find_list_url(&config.username, &pair.target)
-                .await?
+            list_urls
+                .get(&pair.target.to_lowercase())
+                .cloned()
                 .unwrap_or_else(|| pair.target_url(&config.username))
         };
         let description =
@@ -72,9 +77,9 @@ async fn main() -> Result<()> {
         let target_url = if args.dry_run {
             tagged.target_url(&config.username)
         } else {
-            client
-                .find_list_url(&config.username, &tagged.target)
-                .await?
+            list_urls
+                .get(&tagged.target.to_lowercase())
+                .cloned()
                 .unwrap_or_else(|| tagged.target_url(&config.username))
         };
         let target = if args.dry_run {

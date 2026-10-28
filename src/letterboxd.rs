@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     io::Write,
     process::{Command, Stdio},
@@ -243,11 +243,12 @@ impl LetterboxdClient {
         parse_target_list(&html).map(Some)
     }
 
-    pub async fn find_list_url(&self, username: &str, name: &str) -> Result<Option<Url>> {
+    pub async fn list_urls(&self, username: &str) -> Result<HashMap<String, Url>> {
         let base = Url::parse(&format!("{WEBSITE}/{username}/lists/"))?;
         let selector = Selector::parse("article.list-summary h2.name a[href]")
             .map_err(|error| anyhow!("invalid selector: {error}"))?;
         let mut page = 1_u32;
+        let mut lists = HashMap::new();
 
         loop {
             let page_url = if page == 1 {
@@ -257,7 +258,7 @@ impl LetterboxdClient {
             };
             let (status, html) = self.authenticated_request("GET", page_url.as_str(), None)?;
             if status == StatusCode::NOT_FOUND {
-                return Ok(None);
+                return Ok(lists);
             }
             if !status.is_success() {
                 bail!("failed to fetch {page_url}: HTTP {status}");
@@ -265,13 +266,11 @@ impl LetterboxdClient {
             let document = Html::parse_document(&html);
             for link in document.select(&selector) {
                 let title = link.text().collect::<String>();
-                if title.trim().eq_ignore_ascii_case(name) {
-                    let href = link.value().attr("href").context("list link has no URL")?;
-                    return Ok(Some(base.join(href)?));
-                }
+                let href = link.value().attr("href").context("list link has no URL")?;
+                lists.insert(title.trim().to_lowercase(), base.join(href)?);
             }
             if !has_next_page(&html) {
-                return Ok(None);
+                return Ok(lists);
             }
             page += 1;
         }
@@ -377,6 +376,31 @@ impl LetterboxdClient {
     }
 
     fn authenticated_request(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&str>,
+    ) -> Result<(StatusCode, String)> {
+        const READ_RETRY_DELAYS: [u64; 3] = [2, 5, 10];
+
+        for (attempt, delay) in READ_RETRY_DELAYS.iter().copied().enumerate() {
+            let response = self.authenticated_request_once(method, url, body)?;
+            if !should_retry_read(method, response.0) {
+                return Ok(response);
+            }
+            eprintln!(
+                "Letterboxd read returned HTTP {}; retrying in {delay}s ({}/{})",
+                response.0,
+                attempt + 1,
+                READ_RETRY_DELAYS.len()
+            );
+            std::thread::sleep(Duration::from_secs(delay));
+        }
+
+        self.authenticated_request_once(method, url, body)
+    }
+
+    fn authenticated_request_once(
         &self,
         method: &str,
         url: &str,
@@ -495,6 +519,14 @@ impl LetterboxdClient {
             self.browser_request(url)
         }
     }
+}
+
+fn should_retry_read(method: &str, status: StatusCode) -> bool {
+    method == "GET"
+        && matches!(
+            status,
+            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+        )
 }
 
 fn compact(body: &str) -> String {
@@ -855,5 +887,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("refusing to reorder"));
+    }
+
+    #[test]
+    fn retries_only_safe_rate_limited_reads() {
+        assert!(should_retry_read("GET", StatusCode::FORBIDDEN));
+        assert!(should_retry_read("GET", StatusCode::TOO_MANY_REQUESTS));
+        assert!(!should_retry_read("GET", StatusCode::UNAUTHORIZED));
+        assert!(!should_retry_read("PATCH", StatusCode::FORBIDDEN));
+        assert!(!should_retry_read("POST", StatusCode::TOO_MANY_REQUESTS));
     }
 }
