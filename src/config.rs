@@ -7,12 +7,21 @@ use url::Url;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub username: String,
+    #[serde(default)]
     pub lists: Vec<ListPair>,
+    #[serde(default)]
+    pub tagged_lists: Vec<TaggedList>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ListPair {
     pub source: Url,
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaggedList {
+    pub tag: String,
     pub target: String,
 }
 
@@ -34,13 +43,21 @@ impl Config {
         {
             bail!("username must contain only letters, numbers, hyphens, and underscores");
         }
-        if self.lists.is_empty() {
-            bail!("lists must contain at least one source/target pair");
+        if self.lists.is_empty() && self.tagged_lists.is_empty() {
+            bail!("configure at least one mirrored or tagged list");
         }
         for (index, pair) in self.lists.iter().enumerate() {
             validate_list_url(&pair.source, &format!("lists[{index}].source"))?;
             if slugify(&pair.target).is_empty() {
                 bail!("lists[{index}].target must contain a list name");
+            }
+        }
+        for (index, tagged) in self.tagged_lists.iter().enumerate() {
+            if slugify(&tagged.tag).is_empty() {
+                bail!("tagged_lists[{index}].tag must contain a tag");
+            }
+            if slugify(&tagged.target).is_empty() {
+                bail!("tagged_lists[{index}].target must contain a list name");
             }
         }
         Ok(())
@@ -56,12 +73,26 @@ impl ListPair {
     }
 
     pub fn target_url(&self, username: &str) -> Url {
-        Url::parse(&format!(
-            "https://letterboxd.com/{username}/list/{}/",
-            slugify(&self.target)
-        ))
-        .expect("validated username and target name form a URL")
+        target_url(username, &self.target)
     }
+}
+
+impl TaggedList {
+    pub fn tag_slug(&self) -> String {
+        slugify(&self.tag)
+    }
+
+    pub fn target_url(&self, username: &str) -> Url {
+        target_url(username, &self.target)
+    }
+}
+
+fn target_url(username: &str, name: &str) -> Url {
+    Url::parse(&format!(
+        "https://letterboxd.com/{username}/list/{}/",
+        slugify(name)
+    ))
+    .expect("validated username and target name form a URL")
 }
 
 fn slugify(name: &str) -> String {
@@ -111,15 +142,24 @@ lists:
     target: First List
   - source: https://letterboxd.com/bob/list/two/
     target: "a&a: vampire season"
+tagged_lists:
+  - tag: w/ andrei
+    target: Andrew
 "#,
         )
         .unwrap();
         config.validate().unwrap();
         assert_eq!(config.lists.len(), 2);
+        assert_eq!(config.tagged_lists.len(), 1);
         assert_eq!(config.lists[1].source_username(), "bob");
         assert_eq!(
             config.lists[1].target_url(&config.username).as_str(),
             "https://letterboxd.com/shadrunov/list/aa-vampire-season/"
+        );
+        assert_eq!(config.tagged_lists[0].tag_slug(), "w-andrei");
+        assert_eq!(
+            config.tagged_lists[0].target_url(&config.username).as_str(),
+            "https://letterboxd.com/shadrunov/list/andrew/"
         );
     }
 }

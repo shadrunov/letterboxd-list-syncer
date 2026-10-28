@@ -5,3 +5,7 @@ lists:
     target: "a&a: vampire season"
   - source: https://letterboxd.com/cokewithglitter/list/aa-italian-neorealism/
     target: "a&a: italian neorealism"
+
+tagged_lists:
+  - tag: w/ andrei
+    target: andrew

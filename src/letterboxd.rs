@@ -170,6 +170,67 @@ impl LetterboxdClient {
         Ok(SourceList { description, films })
     }
 
+    pub async fn fetch_owned_list(&self, url: &Url) -> Result<SourceList> {
+        let mut films = Vec::new();
+        let mut seen = HashSet::new();
+        let mut description = String::new();
+        let mut page = 1_u32;
+
+        loop {
+            let page_url = if page == 1 {
+                url.clone()
+            } else {
+                url.join(&format!("page/{page}/"))?
+            };
+            let (status, html) = self.read_request(page_url.as_str())?;
+            if page > 1 && status == StatusCode::NOT_FOUND {
+                break;
+            }
+            if !status.is_success() {
+                bail!("failed to fetch {page_url}: HTTP {status}");
+            }
+            if page == 1 {
+                description = parse_description(&html)?;
+            }
+            let parsed = parse_films(&html)?;
+            if parsed.is_empty() {
+                if page == 1 {
+                    bail!("no films found at {url}");
+                }
+                break;
+            }
+
+            let before = films.len();
+            for film in parsed {
+                if seen.insert(film.lid.clone()) {
+                    films.push(film);
+                }
+            }
+            if films.len() == before || !has_next_page(&html) {
+                break;
+            }
+            page += 1;
+        }
+        Ok(SourceList { description, films })
+    }
+
+    pub async fn fetch_recent_tagged_diary(
+        &self,
+        username: &str,
+        tag_slug: &str,
+    ) -> Result<Vec<Film>> {
+        let url = Url::parse(&format!("{WEBSITE}/{username}/tag/{tag_slug}/diary/"))?;
+        let (status, html) = self.read_request(url.as_str())?;
+        if !status.is_success() {
+            bail!("failed to fetch {url}: HTTP {status}");
+        }
+        let films = parse_diary_films(&html)?;
+        if films.is_empty() {
+            bail!("no tagged diary entries found at {url}");
+        }
+        Ok(films)
+    }
+
     pub async fn inspect_target(&self, target_url: &Url) -> Result<Option<TargetList>> {
         let edit_url = target_url.join("edit/")?;
         let (status, html) = self.authenticated_request("GET", edit_url.as_str(), None)?;
@@ -393,6 +454,47 @@ impl LetterboxdClient {
         let status = StatusCode::from_u16(status.trim().parse()?)?;
         Ok((status, body.to_owned()))
     }
+
+    fn browser_request(&self, url: &str) -> Result<(StatusCode, String)> {
+        let binary = env::var("CURL_IMPERSONATE").unwrap_or_else(|_| "curl_chrome136".into());
+        let output = Command::new(binary)
+            .args([
+                "--silent",
+                "--show-error",
+                "--location",
+                "--max-time",
+                "30",
+                "--header",
+                "Accept: text/html",
+                "--write-out",
+                "\n__HTTP_STATUS__:%{http_code}",
+                url,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .context("curl_chrome136 is required for browser-compatible Letterboxd reads")?;
+        if !output.status.success() {
+            bail!(
+                "browser-compatible request failed: {}",
+                compact(&String::from_utf8_lossy(&output.stderr))
+            );
+        }
+        let output = String::from_utf8(output.stdout).context("curl returned invalid text")?;
+        let (body, status) = output
+            .rsplit_once("\n__HTTP_STATUS__:")
+            .context("curl response did not contain an HTTP status")?;
+        let status = StatusCode::from_u16(status.trim().parse()?)?;
+        Ok((status, body.to_owned()))
+    }
+
+    fn read_request(&self, url: &str) -> Result<(StatusCode, String)> {
+        if self.user_cookie.is_some() {
+            self.authenticated_request("GET", url, None)
+        } else {
+            self.browser_request(url)
+        }
+    }
 }
 
 fn compact(body: &str) -> String {
@@ -441,6 +543,139 @@ fn parse_films(html: &str) -> Result<Vec<Film>> {
         });
     }
     Ok(films)
+}
+
+fn parse_diary_films(html: &str) -> Result<Vec<Film>> {
+    let document = Html::parse_document(html);
+    let row_selector = Selector::parse("tr.diary-entry-row")
+        .map_err(|error| anyhow!("invalid selector: {error}"))?;
+    let film_selector = Selector::parse("[data-postered-identifier][data-item-slug]")
+        .map_err(|error| anyhow!("invalid selector: {error}"))?;
+    let mut films = Vec::new();
+    let mut seen = HashSet::new();
+
+    for row in document.select(&row_selector) {
+        let Some(element) = row.select(&film_selector).next() else {
+            continue;
+        };
+        let Some(film) = parse_film(element)? else {
+            continue;
+        };
+        if seen.insert(film.lid.clone()) {
+            films.push(film);
+        }
+    }
+    Ok(films)
+}
+
+fn parse_film(element: scraper::ElementRef<'_>) -> Result<Option<Film>> {
+    let Some(identifier) = element.value().attr("data-postered-identifier") else {
+        return Ok(None);
+    };
+    let parsed: Value = serde_json::from_str(identifier)
+        .with_context(|| format!("invalid data-postered-identifier: {identifier}"))?;
+    if parsed.get("type").and_then(Value::as_str) != Some("film") {
+        return Ok(None);
+    }
+    let Some(lid) = parsed.get("lid").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    Ok(Some(Film {
+        lid: lid.to_owned(),
+        slug: element
+            .value()
+            .attr("data-item-slug")
+            .unwrap_or_default()
+            .to_owned(),
+        name: element
+            .value()
+            .attr("data-item-name")
+            .unwrap_or_default()
+            .to_owned(),
+    }))
+}
+
+pub fn merge_recent_tagged_films(target: &[Film], recent: &[Film]) -> Result<Option<Vec<Film>>> {
+    if target.is_empty() || recent.is_empty() {
+        bail!("target list and recent tagged diary must not be empty");
+    }
+
+    let target_positions = target
+        .iter()
+        .enumerate()
+        .map(|(index, film)| (film.lid.as_str(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+    let chronological = recent.iter().rev().collect::<Vec<_>>();
+    let mut runs = Vec::new();
+    let mut current: Option<(usize, usize, usize)> = None;
+
+    for (index, film) in chronological.iter().enumerate() {
+        let Some(position) = target_positions.get(film.lid.as_str()).copied() else {
+            continue;
+        };
+        match current {
+            Some((start, last_position, len))
+                if position > last_position && position - last_position <= 3 =>
+            {
+                current = Some((start, position, len + 1));
+            }
+            Some((start, last_position, len)) => {
+                runs.push((start, index - 1, last_position, len));
+                current = Some((index, position, 1));
+            }
+            None => current = Some((index, position, 1)),
+        }
+    }
+    if let Some((start, last_position, len)) = current {
+        runs.push((start, chronological.len() - 1, last_position, len));
+    }
+
+    let (start, _, boundary, overlap) = runs
+        .into_iter()
+        .max_by_key(|(_, _, _, len)| *len)
+        .context("recent tagged diary does not overlap the target list")?;
+    if overlap < 2 {
+        bail!(
+            "could not identify the watched-list boundary from recent tagged entries; refusing to reorder the list"
+        );
+    }
+
+    let watched = target[..=boundary]
+        .iter()
+        .map(|film| film.lid.as_str())
+        .collect::<HashSet<_>>();
+    let anchor_lid = &chronological[start].lid;
+    let mut merged = target.to_vec();
+    let mut cursor = merged
+        .iter()
+        .position(|film| &film.lid == anchor_lid)
+        .context("watched-list anchor disappeared while merging")?;
+
+    for film in &chronological[start + 1..] {
+        match merged.iter().position(|current| current.lid == film.lid) {
+            Some(position) if watched.contains(film.lid.as_str()) && position > cursor => {
+                cursor = position;
+            }
+            Some(position) => {
+                let existing = merged.remove(position);
+                if position < cursor {
+                    cursor -= 1;
+                }
+                cursor += 1;
+                merged.insert(cursor, existing);
+            }
+            None => {
+                cursor += 1;
+                merged.insert(cursor, (*film).clone());
+            }
+        }
+    }
+
+    if merged == target {
+        Ok(None)
+    } else {
+        Ok(Some(merged))
+    }
 }
 
 fn parse_description(html: &str) -> Result<String> {
@@ -497,6 +732,14 @@ fn parse_target_list(html: &str) -> Result<TargetList> {
 mod tests {
     use super::*;
 
+    fn film(lid: &str) -> Film {
+        Film {
+            lid: lid.to_owned(),
+            slug: lid.to_lowercase(),
+            name: lid.to_owned(),
+        }
+    }
+
     #[test]
     fn parses_films_in_order_and_deduplicates() {
         let html = r#"
@@ -537,5 +780,80 @@ mod tests {
     #[test]
     fn missing_authored_description_is_empty() {
         assert_eq!(parse_description("<html></html>").unwrap(), "");
+    }
+
+    #[test]
+    fn parses_recent_diary_films_and_deduplicates_rewatches() {
+        let html = r#"
+<div data-postered-identifier='{&quot;lid&quot;:&quot;ignore&quot;,&quot;type&quot;:&quot;film&quot;}' data-item-slug="ignore" data-item-name="Ignore"></div>
+<table><tbody>
+<tr class="diary-entry-row"><td><div data-postered-identifier='{&quot;lid&quot;:&quot;new&quot;,&quot;type&quot;:&quot;film&quot;}' data-item-slug="new-film" data-item-name="New Film"></div></td></tr>
+<tr class="diary-entry-row"><td><div data-postered-identifier='{&quot;lid&quot;:&quot;old&quot;,&quot;type&quot;:&quot;film&quot;}' data-item-slug="old-film" data-item-name="Old Film"></div></td></tr>
+<tr class="diary-entry-row"><td><div data-postered-identifier='{&quot;lid&quot;:&quot;new&quot;,&quot;type&quot;:&quot;film&quot;}' data-item-slug="new-film" data-item-name="New Film"></div></td></tr>
+</tbody></table>
+"#;
+        let films = parse_diary_films(html).unwrap();
+        assert_eq!(
+            films
+                .iter()
+                .map(|film| film.lid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new", "old"]
+        );
+    }
+
+    #[test]
+    fn inserts_recent_tagged_films_at_watched_boundary_and_moves_tail_entries() {
+        let target = vec![
+            film("old"),
+            film("anchor"),
+            film("unwatched-1"),
+            film("unwatched-2"),
+            film("unwatched-3"),
+            film("unwatched-4"),
+            film("planned-now-watched"),
+            film("unwatched-5"),
+        ];
+        let recent = vec![
+            film("newest"),
+            film("planned-now-watched"),
+            film("new"),
+            film("anchor"),
+            film("old"),
+        ];
+
+        let merged = merge_recent_tagged_films(&target, &recent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged,
+            vec![
+                film("old"),
+                film("anchor"),
+                film("new"),
+                film("planned-now-watched"),
+                film("newest"),
+                film("unwatched-1"),
+                film("unwatched-2"),
+                film("unwatched-3"),
+                film("unwatched-4"),
+                film("unwatched-5"),
+            ]
+        );
+        assert!(
+            merge_recent_tagged_films(&merged, &recent)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn refuses_to_reorder_without_a_stable_boundary() {
+        let error = merge_recent_tagged_films(
+            &[film("old"), film("unwatched")],
+            &[film("new"), film("old")],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing to reorder"));
     }
 }

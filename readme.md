@@ -13,6 +13,10 @@ username: shadrunov
 lists:
   - source: https://letterboxd.com/cokewithglitter/list/aa-vampire-season/
     target: "a&a: vampire season"
+
+tagged_lists:
+  - tag: w/ andrei
+    target: andrew
 ```
 
 Set `username` once, then add a `source` URL and target list name for every list
@@ -22,6 +26,14 @@ name, so Letterboxd-generated slug suffixes do not create duplicates.
 
 Mirrored lists are assumed to be public and unranked. The source description is copied with links to the source and this repository. If the source
 has no description, this credit is the complete target description.
+
+`tagged_lists` incrementally maintains a list whose watched prefix follows a
+diary tag. Each run reads only the first page of that tag's diary. New tagged
+films are inserted oldest-to-newest immediately after the last contiguous
+watched film; the unwatched tail keeps its order. If a newly watched film is
+already in that tail, it is moved to the watched boundary instead of being
+duplicated. The sync fails without changing the list if the recent diary does
+not provide a reliable overlap with the existing watched prefix.
 
 ## authentication
 
@@ -53,8 +65,8 @@ cargo run -- --dry-run
 cargo run
 ```
 
-The dry run only reads the public source lists. The normal run uses the session
-cookies to create or update lists owned by `username`.
+The dry run only reads public lists and tagged diary pages. The normal run uses
+the session cookies to create or update lists owned by `username`.
 
 GitHub Actions runs every six hours at minute `17` (UTC) and can also be started
 from the Actions tab. Concurrent runs are serialized.
